@@ -3243,13 +3243,35 @@ async fn listen_ardour_osc_events(state: Arc<Mutex<ArdourState>>, pending: Arc<M
 async fn handle_osc_packet(packet: osc::Packet, peer_addr: std::net::SocketAddr, state: Arc<Mutex<ArdourState>>, pending: Arc<Mutex<PendingRequests>>) {
     match packet {
         osc::Packet::Message(msg) => {
+            // #region agent log - Log ALL OSC messages to debug transport_state issue
+            let is_transport_related = msg.addr == "/transport_state" || msg.addr == "/transport_frame" || msg.addr == "/strip/play";
+            if is_transport_related {
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("/Users/mariasaldana/mixpilot/.cursor/debug.log") {
+                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    let args_preview = format!("{:?}", msg.args);
+                    let _ = writeln!(file, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"TRANSPORT_OSC_ALL","location":"main.rs:3246","message":"OSC_DEBUG: Received transport-related OSC message","data":{{"addr":"{}","args_preview":"{}"}},"timestamp":{}}}"#, msg.addr, args_preview.replace('"', "\\\""), timestamp);
+                }
+            }
+            // #endregion
+            
+            // Check playback status before logging - only log when playback is active
+            let should_log = {
+                let state_guard = state.lock().await;
+                matches!(state_guard.playback_status, PlaybackStatus::Playing)
+            };
+            
             // Log OSC messages to help debug plugin parameter feedback
             // Only log plugin-related messages, not meter/signal feedback
+            // Only log when playback is active (Playing), suppress when Stopped or Unknown
             if msg.addr.contains("plugin") || 
                (msg.addr.contains("select") && (msg.addr.contains("plugin") || msg.addr == "/select/plugin")) {
-                tracing::info!("Received OSC message from {}: {} {:?}", peer_addr, msg.addr, msg.args);
+                if should_log {
+                    tracing::info!("Received OSC message from {}: {} {:?}", peer_addr, msg.addr, msg.args);
+                }
             } else {
-                tracing::debug!("Received OSC message from {}: {} {:?}", peer_addr, msg.addr, msg.args);
+                if should_log {
+                    tracing::debug!("Received OSC message from {}: {} {:?}", peer_addr, msg.addr, msg.args);
+                }
             }
             
             // Handle /strip/name/<ssid> <name>
@@ -3322,30 +3344,56 @@ async fn handle_osc_packet(packet: osc::Packet, peer_addr: std::net::SocketAddr,
             }
             // Handle /transport_state <state_int> <speed_float> (no /ardour/ prefix, new arg order)
             else if msg.addr == "/transport_state" { 
+                // #region agent log
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("/Users/mariasaldana/mixpilot/.cursor/debug.log") {
+                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    let args_preview = format!("{:?}", msg.args);
+                    let _ = writeln!(file, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"TRANSPORT_STATE_RECEIVED","location":"main.rs:3335","message":"OSC_DEBUG: Received /transport_state message","data":{{"args_count":{},"args_preview":"{}"}},"timestamp":{}}}"#, msg.args.len(), args_preview.replace('"', "\\\""), timestamp);
+                }
+                // #endregion
+                
                 if msg.args.len() == 2 { // Expecting state and speed
                     let transport_state_val = msg.args.get(0).and_then(|arg| if let osc::Type::Int(s) = arg { Some(*s) } else { None });
                     let speed = msg.args.get(1).and_then(|arg| if let osc::Type::Float(s) = arg { Some(*s) } else { None });
 
                     if let (Some(ts_val), Some(s)) = (transport_state_val, speed) {
                         tracing::info!("Ardour feedback: /transport_state state: {}, speed: {}", ts_val, s);
+                        
+                        // #region agent log
+                        let old_status = {
+                            let state_guard = state.lock().await;
+                            format!("{:?}", state_guard.playback_status)
+                        };
+                        // #endregion
+                        
                         let mut current_state_guard = state.lock().await;
-                        match ts_val {
+                        let new_status = match ts_val {
                             0 => { // Stopped
                                 current_state_guard.playback_status = PlaybackStatus::Stopped;
-                                tracing::info!("Playback status updated to Stopped via /transport_state");
+                                "Stopped"
                             }
                             1 => { // Rolling (Playing)
                                 current_state_guard.playback_status = PlaybackStatus::Playing;
-                                tracing::info!("Playback status updated to Playing (Rolling) via /transport_state");
+                                "Playing"
                             }
                             2 => { // Looping (also Playing)
                                 current_state_guard.playback_status = PlaybackStatus::Playing;
-                                tracing::info!("Playback status updated to Playing (Looping) via /transport_state");
+                                "Playing"
                             }
                             _ => {
                                 tracing::warn!("Received /transport_state with unknown state value: {}", ts_val);
+                                "Unknown"
                             }
+                        };
+                        
+                        // #region agent log
+                        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("/Users/mariasaldana/mixpilot/.cursor/debug.log") {
+                            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                            let _ = writeln!(file, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"TRANSPORT_STATE_UPDATED","location":"main.rs:3343","message":"OSC_DEBUG: Playback status updated from /transport_state","data":{{"transport_state_val":{},"old_status":"{}","new_status":"{}","speed":{}}},"timestamp":{}}}"#, ts_val, old_status, new_status, s, timestamp);
                         }
+                        // #endregion
+                        
+                        tracing::info!("Playback status updated to {} via /transport_state", new_status);
                     } else {
                         tracing::warn!("Received /transport_state with unexpected argument types: {:?}. Expected Int, Float.", msg.args);
                     }
@@ -3369,13 +3417,40 @@ async fn handle_osc_packet(packet: osc::Packet, peer_addr: std::net::SocketAddr,
             }
             // Handle playback status updates from /strip/play (original logic)
             else if msg.addr.as_str() == "/strip/play" { // Note the 'else if'
+                // #region agent log
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("/Users/mariasaldana/mixpilot/.cursor/debug.log") {
+                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    let args_preview = format!("{:?}", msg.args);
+                    let old_status = {
+                        let state_guard = state.lock().await;
+                        format!("{:?}", state_guard.playback_status)
+                    };
+                    let _ = writeln!(file, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"STRIP_PLAY_RECEIVED","location":"main.rs:3419","message":"OSC_DEBUG: Received /strip/play message","data":{{"args_preview":"{}","old_status":"{}"}},"timestamp":{}}}"#, args_preview.replace('"', "\\\""), old_status, timestamp);
+                }
+                // #endregion
+                
                 let mut current_state = state.lock().await; // Moved lock inside specific message handling
                     if let Some(osc::Type::Int(is_playing_val)) = msg.args.get(0) {
-                        if *is_playing_val == 1 {
+                        let new_status = if *is_playing_val == 1 {
                             current_state.playback_status = PlaybackStatus::Playing;
-                            tracing::info!("Ardour feedback via /strip/play: Playback Started (state=1)");
+                            "Playing"
                         } else if *is_playing_val == 0 {
                             current_state.playback_status = PlaybackStatus::Stopped;
+                            "Stopped"
+                        } else {
+                            "Unknown"
+                        };
+                        
+                        // #region agent log
+                        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("/Users/mariasaldana/mixpilot/.cursor/debug.log") {
+                            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                            let _ = writeln!(file, r#"{{"sessionId":"debug-session","runId":"run1","hypothesisId":"STRIP_PLAY_UPDATED","location":"main.rs:3422","message":"OSC_DEBUG: Playback status updated from /strip/play","data":{{"is_playing_val":{},"new_status":"{}"}},"timestamp":{}}}"#, is_playing_val, new_status, timestamp);
+                        }
+                        // #endregion
+                        
+                        if *is_playing_val == 1 {
+                            tracing::info!("Ardour feedback via /strip/play: Playback Started (state=1)");
+                        } else if *is_playing_val == 0 {
                             tracing::info!("Ardour feedback via /strip/play: Playback Stopped (state=0)");
                         } else {
                             tracing::warn!(
