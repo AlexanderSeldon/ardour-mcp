@@ -131,6 +131,10 @@ struct PendingRequests {
     batch_param_values: HashMap<(i32, i32), oneshot::Sender<Vec<f32>>>,
     // (ssid, slot) -> oneshot to deliver completion from /strip/plugin/descriptor_end
     descriptor_done: HashMap<(i32, i32), oneshot::Sender<()>>,
+    // MixPilot reply channels for native OSC endpoints
+    sample_rate: Option<oneshot::Sender<i32>>,
+    loop_range: Option<oneshot::Sender<Option<(i32, i32, f32, f32)>>>,
+    auto_value: Option<oneshot::Sender<f32>>,
 }
 
 #[derive(Deserialize, JsonSchema, Debug)]
@@ -570,8 +574,48 @@ impl ArdourService {
         Ok(values)
     }
 
+    // MixPilot await helpers for native OSC reply endpoints
+    async fn await_sample_rate(&self, timeout_ms: u64) -> Result<i32> {
+        let (tx, rx) = oneshot::channel::<i32>();
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.sample_rate = Some(tx);
+        }
+        let v = tokio::time::timeout(Duration::from_millis(timeout_ms), rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for /mixpilot/reply/sample_rate"))?
+            .map_err(|_| anyhow::anyhow!("Sample rate request cancelled"))?;
+        Ok(v)
+    }
+
+    async fn await_loop_range(&self, timeout_ms: u64) -> Result<Option<(i32, i32, f32, f32)>> {
+        let (tx, rx) = oneshot::channel::<Option<(i32, i32, f32, f32)>>();
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.loop_range = Some(tx);
+        }
+        let v = tokio::time::timeout(Duration::from_millis(timeout_ms), rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for /mixpilot/reply/loop_range"))?
+            .map_err(|_| anyhow::anyhow!("Loop range request cancelled"))?;
+        Ok(v)
+    }
+
+    async fn await_auto_value(&self, timeout_ms: u64) -> Result<f32> {
+        let (tx, rx) = oneshot::channel::<f32>();
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.auto_value = Some(tx);
+        }
+        let v = tokio::time::timeout(Duration::from_millis(timeout_ms), rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for /mixpilot/reply/auto_value"))?
+            .map_err(|_| anyhow::anyhow!("Auto value request cancelled"))?;
+        Ok(v)
+    }
+
     #[tool(name = "transport_play", description = "Starts Ardour playback.")]
-    async fn transport_play_tool(&self) -> Result<CallToolResult, McpError> { 
+    async fn transport_play_tool(&self) -> Result<CallToolResult, McpError> {
         tracing::info!("Executing transport_play_tool");
         match self.send_osc_message("/transport_play", None).await {
             Ok(_) => Ok(CallToolResult::success(vec![Content::text("Playback started")])),
@@ -1980,64 +2024,27 @@ impl ArdourService {
         #[schemars(description = "No arguments required.")]
         #[tool(aggr)] _args: GetSessionSampleRateArgs
     ) -> Result<CallToolResult, McpError> {
-        tracing::info!("Getting session sample rate from Ardour");
-        
-        // Execute Lua script via access_action
-        let script_name = "MixPilot: Get Session Sample Rate";
-        let osc_args = vec![osc::Type::String(script_name.to_string())];
-        
-        match self.send_osc_message("/access_action", Some(osc_args)).await {
-            Ok(_) => {
-                tracing::info!("Successfully executed get_session_sample_rate script");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to execute get_session_sample_rate script: {}", e);
-                // Continue anyway - try to read result
-            }
+        tracing::info!("Getting session sample rate from Ardour via native OSC");
+
+        let osc_args = vec![osc::Type::Int(9099)]; // reply port
+        if let Err(e) = self.send_osc_message("/mixpilot/get_sample_rate", Some(osc_args)).await {
+            tracing::warn!("Failed to send get_sample_rate OSC: {}. Defaulting to 48000 Hz", e);
+            let result = json!({ "sample_rate": 48000 });
+            let result_str = serde_json::to_string_pretty(&result)
+                .unwrap_or_else(|_| "{\"sample_rate\":48000}".to_string());
+            return Ok(CallToolResult::success(vec![Content::text(result_str)]));
         }
-        
-        // Wait a bit for script to execute
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        
-        // Read result from temp file
-        let temp_file = "/tmp/mixpilot_sample_rate.json";
-        match std::fs::read_to_string(temp_file) {
-            Ok(content) => {
-                match serde_json::from_str::<serde_json::Value>(&content) {
-                    Ok(json_val) => {
-                        if let Some(sample_rate) = json_val.get("sample_rate").and_then(|v| v.as_u64()) {
-                            let result = json!({ "sample_rate": sample_rate });
-                            let result_str = serde_json::to_string_pretty(&result)
-                                .unwrap_or_else(|_| "{\"sample_rate\":48000}".to_string());
-                            tracing::info!("Successfully read sample rate: {} Hz", sample_rate);
-                            Ok(CallToolResult::success(vec![Content::text(result_str)]))
-                        } else if json_val.get("error").is_some() {
-                            let error_msg = json_val.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
-                            tracing::warn!("Script returned error: {}", error_msg);
-                            // Fallback to 48000
-                            let result = json!({ "sample_rate": 48000 });
-                            let result_str = serde_json::to_string_pretty(&result)
-                                .unwrap_or_else(|_| "{\"sample_rate\":48000}".to_string());
-                            Ok(CallToolResult::success(vec![Content::text(result_str)]))
-                        } else {
-                            tracing::warn!("Unexpected JSON format in sample rate result");
-                            let result = json!({ "sample_rate": 48000 });
-                            let result_str = serde_json::to_string_pretty(&result)
-                                .unwrap_or_else(|_| "{\"sample_rate\":48000}".to_string());
-                            Ok(CallToolResult::success(vec![Content::text(result_str)]))
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse sample rate JSON: {}", e);
-                        let result = json!({ "sample_rate": 48000 });
-                        let result_str = serde_json::to_string_pretty(&result)
-                            .unwrap_or_else(|_| "{\"sample_rate\":48000}".to_string());
-                        Ok(CallToolResult::success(vec![Content::text(result_str)]))
-                    }
-                }
+
+        match self.await_sample_rate(1000).await {
+            Ok(sr) => {
+                tracing::info!("Received sample rate: {} Hz", sr);
+                let result = json!({ "sample_rate": sr });
+                let result_str = serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|_| format!("{{\"sample_rate\":{}}}", sr));
+                Ok(CallToolResult::success(vec![Content::text(result_str)]))
             }
             Err(e) => {
-                tracing::warn!("Failed to read sample rate temp file: {}. Defaulting to 48000 Hz", e);
+                tracing::warn!("Timed out or failed getting sample rate: {}. Defaulting to 48000 Hz", e);
                 let result = json!({ "sample_rate": 48000 });
                 let result_str = serde_json::to_string_pretty(&result)
                     .unwrap_or_else(|_| "{\"sample_rate\":48000}".to_string());
@@ -2052,51 +2059,33 @@ impl ArdourService {
         #[schemars(description = "No arguments required.")]
         #[tool(aggr)] _args: GetLoopRangeArgs
     ) -> Result<CallToolResult, McpError> {
-        tracing::info!("Getting loop range from Ardour");
-        
-        // Execute Lua script via access_action
-        let script_name = "MixPilot: Get Loop Range";
-        let osc_args = vec![osc::Type::String(script_name.to_string())];
-        
-        match self.send_osc_message("/access_action", Some(osc_args)).await {
-            Ok(_) => {
-                tracing::info!("Successfully executed get_loop_range script");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to execute get_loop_range script: {}", e);
-                // Continue anyway - try to read result
-            }
+        tracing::info!("Getting loop range from Ardour via native OSC");
+
+        let osc_args = vec![osc::Type::Int(9099)]; // reply port
+        if let Err(e) = self.send_osc_message("/mixpilot/get_loop_range", Some(osc_args)).await {
+            tracing::warn!("Failed to send get_loop_range OSC: {}. Returning null", e);
+            return Ok(CallToolResult::success(vec![Content::text("null".to_string())]));
         }
-        
-        // Wait a bit for script to execute
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        
-        // Read result from temp file
-        let temp_file = "/tmp/mixpilot_loop_range.json";
-        match std::fs::read_to_string(temp_file) {
-            Ok(content) => {
-                // Check if content is "null"
-                let trimmed = content.trim();
-                if trimmed == "null" {
-                    tracing::info!("No loop range set (script returned null)");
-                    Ok(CallToolResult::success(vec![Content::text("null".to_string())]))
-                } else {
-                    match serde_json::from_str::<serde_json::Value>(&content) {
-                        Ok(json_val) => {
-                            let result_str = serde_json::to_string_pretty(&json_val)
-                                .unwrap_or_else(|_| "null".to_string());
-                            tracing::info!("Successfully read loop range");
-                            Ok(CallToolResult::success(vec![Content::text(result_str)]))
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse loop range JSON: {}", e);
-                            Ok(CallToolResult::success(vec![Content::text("null".to_string())]))
-                        }
-                    }
-                }
+
+        match self.await_loop_range(1000).await {
+            Ok(Some((start, end, start_sec, end_sec))) => {
+                let result = json!({
+                    "loop_start_samples": start,
+                    "loop_end_samples": end,
+                    "loop_start_seconds": start_sec,
+                    "loop_end_seconds": end_sec
+                });
+                let result_str = serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|_| "null".to_string());
+                tracing::info!("Loop range: {} - {} samples", start, end);
+                Ok(CallToolResult::success(vec![Content::text(result_str)]))
+            }
+            Ok(None) => {
+                tracing::info!("No loop range set");
+                Ok(CallToolResult::success(vec![Content::text("null".to_string())]))
             }
             Err(e) => {
-                tracing::warn!("Failed to read loop range temp file: {}. Returning null", e);
+                tracing::warn!("Failed to get loop range: {}. Returning null", e);
                 Ok(CallToolResult::success(vec![Content::text("null".to_string())]))
             }
         }
@@ -2213,88 +2202,40 @@ impl ArdourService {
         #[tool(aggr)] args: WritePluginAutomationArgs
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
-            "Writing plugin automation: route_id={}, plugin_slot={}, param_id={}, time_samples={}, value={}",
+            "Writing plugin automation via native OSC: route_id={}, plugin_slot={}, param_id={}, time_samples={}, value={}",
             args.route_id, args.plugin_slot, args.param_id, args.time_samples, args.value
         );
-        
-        // Write arguments to temp file for Lua script
-        let temp_file = "/tmp/mixpilot_automation_args.json";
-        let args_json = json!({
-            "route_id": args.route_id,
-            "plugin_slot": args.plugin_slot,
-            "param_id": args.param_id,
-            "time_samples": args.time_samples,
-            "value": args.value
-        });
-        
-        match std::fs::write(temp_file, serde_json::to_string(&args_json).unwrap_or_default()) {
+
+        // Convert 0-indexed slot/param to 1-indexed for Ardour OSC
+        let piid_1idx = args.plugin_slot + 1;
+        let par_1idx = args.param_id + 1;
+
+        let osc_args = vec![
+            osc::Type::Int(args.route_id),
+            osc::Type::Int(piid_1idx),
+            osc::Type::Int(par_1idx),
+            osc::Type::Int(args.time_samples as i32),
+            osc::Type::Float(args.value),
+        ];
+
+        match self.send_osc_message("/mixpilot/write_plugin_auto", Some(osc_args)).await {
             Ok(_) => {
-                tracing::info!("Wrote automation arguments to temp file");
+                let result = json!({
+                    "success": true,
+                    "route_id": args.route_id,
+                    "plugin_slot": args.plugin_slot,
+                    "param_id": args.param_id,
+                    "time_samples": args.time_samples,
+                    "value": args.value
+                });
+                let result_str = serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|_| "{\"success\":true}".to_string());
+                tracing::info!("Successfully sent plugin automation point");
+                Ok(CallToolResult::success(vec![Content::text(result_str)]))
             }
             Err(e) => {
-                let error_msg = format!("Failed to write automation arguments to temp file: {}", e);
-                tracing::error!("{}", error_msg);
-                return Ok(CallToolResult::error(vec![Content::text(error_msg)]));
-            }
-        }
-        
-        // Execute Lua script via access_action
-        let script_name = "MixPilot: Write Plugin Automation";
-        let osc_args = vec![osc::Type::String(script_name.to_string())];
-        
-        match self.send_osc_message("/access_action", Some(osc_args)).await {
-            Ok(_) => {
-                tracing::info!("Successfully executed write_plugin_automation script");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to execute write_plugin_automation script: {}", e);
-                // Continue anyway - try to read result
-            }
-        }
-        
-        // Wait a bit for script to execute
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        
-        // Read result from temp file
-        let result_file = "/tmp/mixpilot_automation_result.json";
-        match std::fs::read_to_string(result_file) {
-            Ok(content) => {
-                match serde_json::from_str::<serde_json::Value>(&content) {
-                    Ok(json_val) => {
-                        if let Some(success) = json_val.get("success").and_then(|v| v.as_bool()) {
-                            if success {
-                                let result_str = serde_json::to_string_pretty(&json_val)
-                                    .unwrap_or_else(|_| "{\"success\":true}".to_string());
-                                tracing::info!("Successfully wrote automation point");
-                                Ok(CallToolResult::success(vec![Content::text(result_str)]))
-                            } else {
-                                let error_msg = json_val.get("error")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("Unknown error");
-                                tracing::error!("Script returned error: {}", error_msg);
-                                Ok(CallToolResult::error(vec![Content::text(format!(
-                                    "Failed to write automation: {}", error_msg
-                                ))]))
-                            }
-                        } else {
-                            tracing::warn!("Unexpected JSON format in automation result");
-                            Ok(CallToolResult::error(vec![Content::text(
-                                "Unexpected result format from automation script".to_string()
-                            )]))
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse automation result JSON: {}", e);
-                        Ok(CallToolResult::error(vec![Content::text(format!(
-                            "Failed to parse result: {}", e
-                        ))]))
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to read automation result file: {}", e);
                 Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to read result file: {}", e
+                    "Failed to write plugin automation: {}", e
                 ))]))
             }
         }
@@ -2307,118 +2248,73 @@ impl ArdourService {
         #[tool(aggr)] args: ReadAutomationValueArgs
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
-            "Reading automation value: route_id={}, control_type={}, time_samples={}",
+            "Reading automation value via native OSC: route_id={}, control_type={}, time_samples={}",
             args.route_id, args.control_type, args.time_samples
         );
-        
+
         // Validate control_type
-        if args.control_type != "plugin" && args.control_type != "gain" && 
+        if args.control_type != "plugin" && args.control_type != "gain" &&
            args.control_type != "pan_azimuth" && args.control_type != "pan_width" {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "Invalid control_type: {}. Must be 'plugin', 'gain', 'pan_azimuth', or 'pan_width'",
                 args.control_type
             ))]));
         }
-        
-        // Validate plugin_slot and param_id for plugin control_type
+
         if args.control_type == "plugin" {
             if args.plugin_slot.is_none() || args.param_id.is_none() {
                 return Ok(CallToolResult::error(vec![Content::text(
                     "plugin_slot and param_id are required for 'plugin' control_type".to_string()
                 )]));
             }
+            let piid_1idx = args.plugin_slot.unwrap() + 1;
+            let par_1idx = args.param_id.unwrap() + 1;
+
+            let osc_args = vec![
+                osc::Type::Int(args.route_id),
+                osc::Type::Int(piid_1idx),
+                osc::Type::Int(par_1idx),
+                osc::Type::Int(args.time_samples as i32),
+                osc::Type::Int(9099), // reply port
+            ];
+
+            if let Err(e) = self.send_osc_message("/mixpilot/read_plugin_auto", Some(osc_args)).await {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to send read_plugin_auto: {}", e
+                ))]));
+            }
+        } else {
+            let osc_args = vec![
+                osc::Type::Int(args.route_id),
+                osc::Type::String(args.control_type.clone()),
+                osc::Type::Int(args.time_samples as i32),
+                osc::Type::Int(9099), // reply port
+            ];
+
+            if let Err(e) = self.send_osc_message("/mixpilot/read_track_auto", Some(osc_args)).await {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to send read_track_auto: {}", e
+                ))]));
+            }
         }
-        
-        // Write arguments to temp file for Lua script
-        let temp_file = "/tmp/mixpilot_read_automation_args.json";
-        let mut args_json = json!({
-            "route_id": args.route_id,
-            "control_type": args.control_type,
-            "time_samples": args.time_samples
-        });
-        
-        if let Some(plugin_slot) = args.plugin_slot {
-            args_json["plugin_slot"] = json!(plugin_slot);
-        }
-        if let Some(param_id) = args.param_id {
-            args_json["param_id"] = json!(param_id);
-        }
-        
-        match std::fs::write(temp_file, serde_json::to_string(&args_json).unwrap_or_default()) {
-            Ok(_) => {
-                tracing::info!("Wrote read automation arguments to temp file");
+
+        match self.await_auto_value(1500).await {
+            Ok(value) => {
+                let result = json!({
+                    "success": true,
+                    "value": value,
+                    "route_id": args.route_id,
+                    "control_type": args.control_type,
+                    "time_samples": args.time_samples
+                });
+                let result_str = serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|_| format!("{{\"success\":true,\"value\":{}}}", value));
+                tracing::info!("Read automation value: {}", value);
+                Ok(CallToolResult::success(vec![Content::text(result_str)]))
             }
             Err(e) => {
-                let error_msg = format!("Failed to write read automation arguments to temp file: {}", e);
-                tracing::error!("{}", error_msg);
-                return Ok(CallToolResult::error(vec![Content::text(error_msg)]));
-            }
-        }
-        
-        // Execute Lua script via access_action
-        let script_name = "MixPilot: Read Automation Value";
-        let osc_args = vec![osc::Type::String(script_name.to_string())];
-        
-        match self.send_osc_message("/access_action", Some(osc_args)).await {
-            Ok(_) => {
-                tracing::info!("Successfully executed read_automation_value script");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to execute read_automation_value script: {}", e);
-                // Continue anyway - try to read result
-            }
-        }
-        
-        // Wait a bit for script to execute
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        
-        // Read result from temp file
-        let result_file = "/tmp/mixpilot_read_automation_result.json";
-        match std::fs::read_to_string(result_file) {
-            Ok(content) => {
-                match serde_json::from_str::<serde_json::Value>(&content) {
-                    Ok(json_val) => {
-                        if let Some(success) = json_val.get("success").and_then(|v| v.as_bool()) {
-                            if success {
-                                if let Some(value) = json_val.get("value").and_then(|v| v.as_f64()) {
-                                    let result_str = serde_json::to_string_pretty(&json_val)
-                                        .unwrap_or_else(|_| format!("{{\"success\":true,\"value\":{}}}", value));
-                                    tracing::info!("Successfully read automation value: {}", value);
-                                    Ok(CallToolResult::success(vec![Content::text(result_str)]))
-                                } else {
-                                    tracing::warn!("Success but no value in result");
-                                    Ok(CallToolResult::error(vec![Content::text(
-                                        "Result missing value field".to_string()
-                                    )]))
-                                }
-                            } else {
-                                let error_msg = json_val.get("error")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("Unknown error");
-                                tracing::error!("Script returned error: {}", error_msg);
-                                Ok(CallToolResult::error(vec![Content::text(format!(
-                                    "Failed to read automation value: {}", error_msg
-                                ))]))
-                            }
-                        } else {
-                            tracing::warn!("Unexpected JSON format in read automation result");
-                            Ok(CallToolResult::error(vec![Content::text(
-                                "Unexpected result format from read automation script".to_string()
-                            )]))
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse read automation result JSON: {}", e);
-                        Ok(CallToolResult::error(vec![Content::text(format!(
-                            "Failed to parse result: {}", e
-                        ))]))
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to read automation result file: {}", e);
                 Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to read result file: {}", e
+                    "Failed to read automation value: {}", e
                 ))]))
             }
         }
@@ -2431,10 +2327,10 @@ impl ArdourService {
         #[tool(aggr)] args: WriteTrackAutomationArgs
     ) -> Result<CallToolResult, McpError> {
         tracing::info!(
-            "Writing track automation: route_id={}, control_type={}, time_samples={}, value={}, use_current_as_start={:?}",
+            "Writing track automation via native OSC: route_id={}, control_type={}, time_samples={}, value={}, use_current_as_start={:?}",
             args.route_id, args.control_type, args.time_samples, args.value, args.use_current_as_start
         );
-        
+
         // Validate control_type
         if args.control_type != "gain" && args.control_type != "pan_azimuth" && args.control_type != "pan_width" {
             return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -2442,85 +2338,31 @@ impl ArdourService {
                 args.control_type
             ))]));
         }
-        
-        // Write arguments to temp file for Lua script
-        let temp_file = "/tmp/mixpilot_track_automation_args.json";
-        let args_json = json!({
-            "route_id": args.route_id,
-            "control_type": args.control_type,
-            "time_samples": args.time_samples,
-            "value": args.value,
-            "use_current_as_start": args.use_current_as_start.unwrap_or(false)
-        });
-        
-        match std::fs::write(temp_file, serde_json::to_string(&args_json).unwrap_or_default()) {
+
+        let osc_args = vec![
+            osc::Type::Int(args.route_id),
+            osc::Type::String(args.control_type.clone()),
+            osc::Type::Int(args.time_samples as i32),
+            osc::Type::Float(args.value),
+        ];
+
+        match self.send_osc_message("/mixpilot/write_track_auto", Some(osc_args)).await {
             Ok(_) => {
-                tracing::info!("Wrote track automation arguments to temp file");
+                let result = json!({
+                    "success": true,
+                    "route_id": args.route_id,
+                    "control_type": args.control_type,
+                    "time_samples": args.time_samples,
+                    "value": args.value
+                });
+                let result_str = serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|_| "{\"success\":true}".to_string());
+                tracing::info!("Successfully sent track automation point");
+                Ok(CallToolResult::success(vec![Content::text(result_str)]))
             }
             Err(e) => {
-                let error_msg = format!("Failed to write track automation arguments to temp file: {}", e);
-                tracing::error!("{}", error_msg);
-                return Ok(CallToolResult::error(vec![Content::text(error_msg)]));
-            }
-        }
-        
-        // Execute Lua script via access_action
-        let script_name = "MixPilot: Write Track Automation";
-        let osc_args = vec![osc::Type::String(script_name.to_string())];
-        
-        match self.send_osc_message("/access_action", Some(osc_args)).await {
-            Ok(_) => {
-                tracing::info!("Successfully executed write_track_automation script");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to execute write_track_automation script: {}", e);
-                // Continue anyway - try to read result
-            }
-        }
-        
-        // Wait a bit for script to execute
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        
-        // Read result from temp file
-        let result_file = "/tmp/mixpilot_track_automation_result.json";
-        match std::fs::read_to_string(result_file) {
-            Ok(content) => {
-                match serde_json::from_str::<serde_json::Value>(&content) {
-                    Ok(json_val) => {
-                        if let Some(success) = json_val.get("success").and_then(|v| v.as_bool()) {
-                            if success {
-                                let result_str = serde_json::to_string_pretty(&json_val)
-                                    .unwrap_or_else(|_| "{\"success\":true}".to_string());
-                                tracing::info!("Successfully wrote track automation point");
-                                Ok(CallToolResult::success(vec![Content::text(result_str)]))
-                            } else {
-                                let error_msg = json_val.get("error")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("Unknown error");
-                                tracing::error!("Script returned error: {}", error_msg);
-                                Ok(CallToolResult::error(vec![Content::text(format!(
-                                    "Failed to write track automation: {}", error_msg
-                                ))]))
-                            }
-                        } else {
-                            tracing::warn!("Unexpected JSON format in track automation result");
-                            Ok(CallToolResult::error(vec![Content::text(
-                                "Unexpected result format from track automation script".to_string()
-                            )]))
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to parse track automation result JSON: {}", e);
-                        Ok(CallToolResult::error(vec![Content::text(format!(
-                            "Failed to parse result: {}", e
-                        ))]))
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to read track automation result file: {}", e);
                 Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to read result file: {}", e
+                    "Failed to write track automation: {}", e
                 ))]))
             }
         }
@@ -3994,6 +3836,61 @@ async fn handle_osc_packet(packet: osc::Packet, peer_addr: std::net::SocketAddr,
                     let mut pending_state = pending.lock().await;
                     if let Some(tx) = pending_state.batch_param_values.remove(&(ssid, slot)) {
                         let _ = tx.send(values);
+                    }
+                }
+            }
+            // MixPilot reply handlers for native OSC endpoints
+            else if msg.addr == "/mixpilot/reply/sample_rate" {
+                if let Some(osc::Type::Int(sr)) = msg.args.get(0) {
+                    tracing::info!("Received /mixpilot/reply/sample_rate: {} Hz", sr);
+                    let mut pending_state = pending.lock().await;
+                    if let Some(tx) = pending_state.sample_rate.take() {
+                        let _ = tx.send(*sr);
+                    }
+                }
+            }
+            else if msg.addr == "/mixpilot/reply/loop_range" {
+                let mut pending_state = pending.lock().await;
+                if let Some(tx) = pending_state.loop_range.take() {
+                    if msg.args.len() == 1 {
+                        // Single int 0 = no loop set
+                        tracing::info!("Received /mixpilot/reply/loop_range: no loop");
+                        let _ = tx.send(None);
+                    } else if msg.args.len() >= 4 {
+                        let start = match msg.args.get(0) {
+                            Some(osc::Type::Int(v)) => *v,
+                            _ => { let _ = tx.send(None); return; }
+                        };
+                        let end = match msg.args.get(1) {
+                            Some(osc::Type::Int(v)) => *v,
+                            _ => { let _ = tx.send(None); return; }
+                        };
+                        let start_sec = match msg.args.get(2) {
+                            Some(osc::Type::Float(v)) => *v,
+                            _ => { let _ = tx.send(None); return; }
+                        };
+                        let end_sec = match msg.args.get(3) {
+                            Some(osc::Type::Float(v)) => *v,
+                            _ => { let _ = tx.send(None); return; }
+                        };
+                        tracing::info!("Received /mixpilot/reply/loop_range: {} - {} samples", start, end);
+                        let _ = tx.send(Some((start, end, start_sec, end_sec)));
+                    } else {
+                        let _ = tx.send(None);
+                    }
+                }
+            }
+            else if msg.addr == "/mixpilot/reply/auto_value" {
+                if let Some(value) = match msg.args.get(0) {
+                    Some(osc::Type::Float(v)) => Some(*v),
+                    Some(osc::Type::Double(d)) => Some(*d as f32),
+                    Some(osc::Type::Int(i)) => Some(*i as f32),
+                    _ => None,
+                } {
+                    tracing::info!("Received /mixpilot/reply/auto_value: {}", value);
+                    let mut pending_state = pending.lock().await;
+                    if let Some(tx) = pending_state.auto_value.take() {
+                        let _ = tx.send(value);
                     }
                 }
             }
